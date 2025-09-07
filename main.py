@@ -4,13 +4,13 @@ import torch
 import whisperx
 import requests
 from datetime import timedelta
-# from whisperx.diarization import DiarizationPipeline
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
-
-# New import for diarization
+from dotenv import load_dotenv
+from whisperx.diarize import assign_word_speakers
 from pyannote.audio import Pipeline
+import pandas as pd
 
 # Suppress torchaudio backend warning
 import warnings
@@ -19,11 +19,14 @@ warnings.filterwarnings(
     message="torchaudio._backend.set_audio_backend has been deprecated"
 )
 
+# ========= Load Environment Variables =========
+load_dotenv()
+
 # ========= CONFIG =========
 USE_OLLAMA = True  # True = Ollama, False = OpenAI
 OLLAMA_MODEL = "llama3"  # local model name
 HF_TOKEN = os.getenv("HF_TOKEN")  # HuggingFace token for diarization
-# OPENAI_MODEL = "gpt-4o-mini"  # if using OpenAI
+
 
 # ========= Helpers =========
 def format_timestamp(seconds: float) -> str:
@@ -114,15 +117,18 @@ async def transcribe_audio(file: UploadFile = File(...)):
         model = model.half()  # optional half precision on GPU
 
     # Step 2: Transcribe
-    # FP16 will only be used automatically if supported by the device
     asr_result = model.transcribe(
         temp_path,
         fp16=(compute_type == "float16")
     )
 
     # Step 3: Alignment
-    align_model, metadata = whisperx.load_align_model(language_code=asr_result["language"], device=device)
-    asr_aligned = whisperx.align(asr_result["segments"], align_model, metadata, temp_path, device)
+    align_model, metadata = whisperx.load_align_model(
+        language_code=asr_result["language"], device=device
+    )
+    asr_aligned = whisperx.align(
+        asr_result["segments"], align_model, metadata, temp_path, device
+    )
 
     # Step 4: Diarization using pyannote.audio
     diarization_pipeline = Pipeline.from_pretrained(
@@ -131,7 +137,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
     )
     diarization_result = diarization_pipeline(temp_path)
 
-    # Convert pyannote output to WhisperX-style segments
+    # Convert diarization result to DataFrame
     diarize_segments = []
     for turn, _, speaker in diarization_result.itertracks(yield_label=True):
         diarize_segments.append({
@@ -139,35 +145,37 @@ async def transcribe_audio(file: UploadFile = File(...)):
             "end": turn.end,
             "speaker": speaker
         })
+    diarize_df = pd.DataFrame(diarize_segments)
 
-    # Assign word-level speakers
-    result = whisperx.assign_word_speakers(diarize_segments, asr_aligned)
+    # Step 5: Assign word-level speakers
+    friendly_segments, word_segments = assign_word_speakers(
+        diarize_df, asr_aligned["segments"]
+    )
 
-    # Step 4: Rename speakers
-    friendly_segments, mapping = rename_speakers(result["segments"])
+    # Step 6: Rename speakers
+    renamed_segments, mapping = rename_speakers(friendly_segments)
 
-    # Step 5: Export JSON
+    # Step 7: Export JSON
     with open("transcript.json", "w", encoding="utf-8") as f:
-        json.dump(friendly_segments, f, indent=2, ensure_ascii=False)
+        json.dump(renamed_segments, f, indent=2, ensure_ascii=False)
 
-    # Step 6: Export SRT
+    # Step 8: Export SRT
     with open("transcript.srt", "w", encoding="utf-8") as f:
-        for i, seg in enumerate(friendly_segments, start=1):
+        for i, seg in enumerate(renamed_segments, start=1):
             f.write(f"{i}\n")
             f.write(f"{format_timestamp(seg['start'])} --> {format_timestamp(seg['end'])}\n")
             f.write(f"{seg['speaker']}: {seg['text']}\n\n")
 
-    # Step 7: Export VTT
+    # Step 9: Export VTT
     with open("transcript.vtt", "w", encoding="utf-8") as f:
         f.write("WEBVTT\n\n")
-        for seg in friendly_segments:
+        for seg in renamed_segments:
             f.write(f"{format_timestamp(seg['start'])} --> {format_timestamp(seg['end'])}\n")
             f.write(f"{seg['speaker']}: {seg['text']}\n\n")
 
-    # Step 8: Summarization
-    full_text = "\n".join(f"{s['speaker']}: {s['text']}" for s in friendly_segments)
+    # Step 10: Summarization (optional)
+    # full_text = "\n".join(f"{s['speaker']}: {s['text']}" for s in renamed_segments)
     # summary = summarize_with_ollama(full_text, model=OLLAMA_MODEL) if USE_OLLAMA else ""
-    #
     # with open("summary.txt", "w", encoding="utf-8") as f:
     #     f.write(summary)
 
@@ -176,7 +184,6 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
     return JSONResponse({
         "mapping": mapping,
-        # "summary": summary,
         "files": {
             "json": "transcript.json",
             "srt": "transcript.srt",
